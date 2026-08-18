@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+data/
+data_test/
+.test_logs/
+config.json
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Temporary scripts
+*.tmp
+tmp/
+
+# MCP node_modules (if any)
+node_modules/

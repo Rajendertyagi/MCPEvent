@@ -1,0 +1,6 @@
+# MCP Event Server — dependencies
+#
+# The only direct dependency is the official MCP SDK.
+# All other packages (uvicorn, starlette, pydantic, etc.) are
+# pulled in automatically as transitive dependencies.
+mcp>=2.0.0,<3.0.0

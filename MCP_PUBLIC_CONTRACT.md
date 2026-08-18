@@ -1,9 +1,10 @@
 # MCP Event Server — Public Contract
 
-**Version:** 1.0.0-candidate
+**Version:** 1.0.0
 **MCP Spec:** 2026-07-28
-**Status:** DRAFT — naming migration hardened, awaiting final verification before freeze
+**Status:** FROZEN
 **Last reviewed:** 2026-08-18
+**Frozen:** 2026-08-18 — frozen only after independent naming-migration verification (verdict: PUBLIC MCP NAMING MIGRATION v1 VERIFIED — READY TO FREEZE)
 
 ---
 
@@ -64,7 +65,7 @@ These are available but intended for development and testing. The broker project
 |-------------|-----------|-------------|--------|
 | `mcp-event://events/latest` | Event dict (see §5) | The most recently published event. Updated via `ResourceUpdated` notification. | **FREEZE** |
 | `mcp-event://events/pending` | Array of event dicts (newest first, max 100) | All persistent events, newest first. | **FREEZE** |
-| `mcp-event://system/info` | Dict with server metadata | Server name, version, features, limits, endpoint, uptime, counts. See §27 for field classification. | **REVIEW BEFORE FREEZE** |
+| `mcp-event://system/info` | Dict with server metadata | Server name, version, features, limits, endpoint, uptime, counts. See §17 for field classification. | **FREEZE** |
 | `mcp-event://sources/status` | Dict of source status objects | Status of each registered source connector. Includes name, type, state, error, cursor, dedup stats. Secrets are sanitized. | **FREEZE** |
 
 ---
@@ -366,15 +367,16 @@ Engineering principle: ONE STABLE CONCEPT → ONE CANONICAL OWNER → IMPORT/REU
 
 ---
 
-## 20. Open Issues Before Freeze
+## 20. Open Issues (Tracked Separately — Non-Blocking for Frozen Contract)
 
-| # | Issue | Severity | Recommendation |
-|---|-------|----------|---------------|
+| # | Issue | Severity | Status |
+|---|-------|----------|--------|
 | 1 | `alerts://pending` → `mcp-event://events/pending` rename | **RESOLVED** | Renamed before freeze; old URI removed |
 | 2 | `persistent_alert_count` → `persistent_event_count` rename | **RESOLVED** | Renamed before freeze |
 | 3 | Unknown consumer behavior inconsistency | **RESOLVED** | All five consumer-requiring tools now raise `ConsumerNotFoundError` → `is_error=True` with `consumer not found: <id>` |
 | 4 | `mcp-event://system/info` exposes `python` and `mcp_sdk` versions | **LOW** | Classified as diagnostic (not frozen broker dependency) |
-| 5 | `json_response=True` + background publication acceptance test not yet run | **INFO** | Run empirical test before production deployment |
+| 5 | `json_response=True` + background publication acceptance test not yet run | **INFO** | Tracked separately; architecture supports it; not a contract blocker |
+| 6 | Test harness teardown port-race (WinError 10048/10053) discovered during verification | **HARNESS** | Tracked separately; NOT a contract defect; does not affect the frozen public contract |
 
 ---
 
@@ -382,36 +384,41 @@ Engineering principle: ONE STABLE CONCEPT → ONE CANONICAL OWNER → IMPORT/REU
 
 | Section | Status |
 |---------|--------|
-| Endpoint & Transport | ✅ READY TO FREEZE |
-| Production Tools (9) | ✅ READY TO FREEZE |
+| Endpoint & Transport | ✅ FROZEN |
+| Production Tools (9) | ✅ FROZEN |
 | Dev/Test Tools (7) | ✅ IDENTIFIED — not for broker dependency |
-| Resources (4) | ✅ READY TO FREEZE |
-| Event Schema | ✅ READY TO FREEZE |
-| Routing | ✅ READY TO FREEZE |
-| Consumer Identity | ✅ READY TO FREEZE |
-| Delivery | ✅ READY TO FREEZE |
-| ACK | ✅ READY TO FREEZE |
-| Checkpoint | ✅ READY TO FREEZE |
-| Replay | ✅ READY TO FREEZE |
-| Subscription/Notification | ✅ READY TO FREEZE |
-| Error Contract | ✅ READY TO FREEZE (with §3 note) |
-| Source Contract | ✅ READY TO FREEZE |
-| Versioning Policy | ✅ READY TO FREEZE |
+| Resources (4) | ✅ FROZEN |
+| Event Schema | ✅ FROZEN |
+| Routing | ✅ FROZEN |
+| Consumer Identity | ✅ FROZEN |
+| Delivery | ✅ FROZEN |
+| ACK | ✅ FROZEN |
+| Checkpoint | ✅ FROZEN |
+| Replay | ✅ FROZEN |
+| Subscription/Notification | ✅ FROZEN |
+| Error Contract | ✅ FROZEN |
+| Source Contract | ✅ FROZEN |
+| Versioning Policy | ✅ FROZEN |
 
 ---
 
 ## 22. Verdict
 
 ```text
-PUBLIC MCP CONTRACT v1.0.0 — CODE COMPLETE, AWAITING FORMAL FREEZE
+PUBLIC MCP CONTRACT v1.0.0 — FROZEN
 ```
+
+**Frozen:** 2026-08-18 — frozen only after independent naming-migration verification (verdict: PUBLIC MCP NAMING MIGRATION v1 VERIFIED — READY TO FREEZE).
 
 **Resolved before freeze:**
 - `alerts://pending` → `mcp-event://events/pending` (old URI removed)
 - `persistent_alert_count` → `persistent_event_count`
 - Unknown-consumer policy normalized: all five consumer-requiring tools raise `ConsumerNotFoundError` → `is_error=True` with `consumer not found: <id>`
 
-**Remaining non-blocking items:**
-- Empirical `json_response=True` + background notification acceptance test should be run before production deployment (architecture supports it; not a contract blocker)
+**Non-blocking items tracked separately (do NOT affect the frozen contract):**
+- Empirical `json_response=True` + background notification acceptance test (architecture supports it; not a contract blocker)
+- Test harness teardown port-race (WinError 10048/10053) discovered during verification — harness defect, not a contract defect
 
-**Recommended next step:** Run the empirical `json_response=True` background-publication acceptance test, then formally freeze the contract (set status to FROZEN and bump to a release version if desired).
+**Compatibility policy (post-freeze):** Renaming/removing tools or resources, changing required parameters, event-field semantics, routing semantics, consumer identity, ACK/checkpoint/replay semantics requires an explicit breaking/versioned contract decision. Additive tools, resources, and optional event fields remain backward-compatible where appropriate.
+
+**CONTRACT_VERSION remains `1.0.0` — not bumped.**

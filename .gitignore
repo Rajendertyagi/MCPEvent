@@ -45,3 +45,6 @@ tmp/
 
 # MCP node_modules (if any)
 node_modules/
+
+# AI assistant memory
+.workbuddy-ai/

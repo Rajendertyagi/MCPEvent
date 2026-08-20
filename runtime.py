@@ -143,6 +143,7 @@ def make_lifespan(
     source_manager: Any = None,
     bus: Any = None,
     source_configs: dict[str, Any] | None = None,
+    metrics: Any = None,
 ) -> Any:
     """
     Build a lifespan context manager for the MCP server.
@@ -157,6 +158,7 @@ def make_lifespan(
         source_manager: Optional SourceManager for source connectors.
         bus: The subscription bus (needed by SourceManager for publisher).
         source_configs: The "sources" section from config.json.
+        metrics: RuntimeMetrics instance for source metrics tracking.
     """
     bg = bg_manager or BackgroundTaskManager()
     ctx = AppContext(store=store)
@@ -171,7 +173,7 @@ def make_lifespan(
         # Initialize and start sources (if any)
         if source_manager is not None:
             try:
-                await source_manager.initialize(bg, store, bus)
+                await source_manager.initialize(bg, store, bus, metrics=metrics)
                 await source_manager.start_all(source_configs or {})
                 logger.info("source manager: started sources")
             except Exception as exc:

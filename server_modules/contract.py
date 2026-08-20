@@ -18,7 +18,7 @@ from __future__ import annotations
 # ─── Contract version ─────────────────────────────────────────────────────────
 # Bumps only when the MCP tool/resource/event contract changes in a breaking way.
 # Distinct from MCP spec version, app version, Python version, and SDK version.
-CONTRACT_VERSION = "1.0.0"
+CONTRACT_VERSION = "1.2.0"
 
 # ─── Resource URIs ─────────────────────────────────────────────────────────────
 # mcp-event:// is an APPLICATION-PRIVATE URI scheme. It is NOT an official
@@ -28,6 +28,8 @@ RESOURCE_EVENT_LATEST = "mcp-event://events/latest"
 RESOURCE_EVENTS_PENDING = "mcp-event://events/pending"
 RESOURCE_SYSTEM_INFO = "mcp-event://system/info"
 RESOURCE_SOURCES_STATUS = "mcp-event://sources/status"
+RESOURCE_SYSTEM_METRICS = "mcp-event://system/metrics"
+RESOURCE_EVENTS_RECENT = "mcp-event://events/recent"
 
 # ─── Production tool names ─────────────────────────────────────────────────────
 TOOL_SYSTEM_PING = "system_ping"
@@ -41,6 +43,13 @@ TOOL_CONSUMER_EVENT_LIST = "consumer_event_list"
 TOOL_CONSUMER_EVENT_PENDING_LIST = "consumer_event_pending_list"
 TOOL_CONSUMER_EVENT_ACKNOWLEDGE = "consumer_event_acknowledge"
 TOOL_CONSUMER_CHECKPOINT_GET = "consumer_checkpoint_get"
+
+# ─── Alert tool names (v1.1.0-candidate) ───────────────────────────────────────
+TOOL_ALERT_CREATE = "alert_create"
+TOOL_ALERT_LIST = "alert_list"
+TOOL_ALERT_GET = "alert_get"
+TOOL_ALERT_ENABLE = "alert_enable"
+TOOL_ALERT_DISABLE = "alert_disable"
 
 # ─── Dev/test tool names ───────────────────────────────────────────────────────
 TOOL_DEV_PROGRESS_TEST = "dev_progress_test"

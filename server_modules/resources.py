@@ -19,6 +19,8 @@ from server_modules.contract import (
     RESOURCE_EVENTS_PENDING,
     RESOURCE_SYSTEM_INFO,
     RESOURCE_SOURCES_STATUS,
+    RESOURCE_SYSTEM_METRICS,
+    RESOURCE_EVENTS_RECENT,
 )
 
 
@@ -98,3 +100,38 @@ def register_resources(mcp, services: "Services", constants: dict[str, str]) -> 
         """Return status of all registered source connectors."""
         status = services.source_manager.get_status()
         return json.dumps(status, indent=2, ensure_ascii=False)
+
+    @mcp.resource(RESOURCE_SYSTEM_METRICS)
+    def system_metrics() -> str:
+        """Return process-wide operational metrics (observational only)."""
+        snap = services.metrics.snapshot()
+        uptime_seconds = (
+            datetime.now(timezone.utc) - services.metrics.started_at
+        ).total_seconds()
+        snap["started_at"] = services.metrics.started_at.isoformat()
+        snap["uptime_seconds"] = round(uptime_seconds, 1)
+        snap["recent_history"] = {
+            "failures_total": snap.get("recent_history", {}).get("failures_total", 0),
+            "count": len(events.get_event_history(limit=events.RECENT_HISTORY_CAPACITY)),
+            "capacity": events.RECENT_HISTORY_CAPACITY,
+        }
+        snap["system"] = {
+            "persistent_event_count": services.store.persistent_event_count(),
+            "persistent_high_water": services.store.persistent_high_water(),
+            "consumer_count": services.store.count_consumers(),
+            "pending_deliveries": services.store.count_unacked_deliveries(),
+        }
+        return json.dumps(snap, ensure_ascii=False)
+
+    @mcp.resource(RESOURCE_EVENTS_RECENT)
+    def events_recent() -> str:
+        """Return the bounded durable recent observational event journal.
+
+        Observational only: not pending delivery, not replay, not ACKable,
+        not checkpoint input. Includes both persistent and nonpersistent events.
+        """
+        recent_events = services.store.get_recent_events(
+            limit=events.RECENT_HISTORY_CAPACITY,
+            newest_first=True,
+        )
+        return json.dumps(recent_events, ensure_ascii=False)

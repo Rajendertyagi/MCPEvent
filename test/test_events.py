@@ -8,7 +8,7 @@ with test_source enabled, then started a THIRD server for the http-poller test
 (3 server starts). The single server is started with test_source enabled
 (transient ticks do not pollute the persistent-only replay used by T9/T11/T12),
 and http_poller disabled (avoids dead-port noise). The http-poller check (P8T7)
-moved to test_source_dedup.py as a direct, server-less test. P8T3 (schema v7)
+moved to test_source_dedup.py as a direct, server-less test. P8T3 (schema v9)
 is verified directly against an isolated EventStore.
 
 Legacy IDs preserved: T1..T14, P7T7, P7T18, P8T1, P8T2, P8T3, P8T4, P8T5,
@@ -295,24 +295,24 @@ async def p8t2_info_features(runner: R) -> None:
                        "source_connectors not True in features")
 
 
-async def p8t3_schema_v7(runner: R) -> None:
-    """P8T3: schema v7 — source_state and source_seen_items tables exist (DIRECT, no server)."""
-    name = "P8T3-schema-v7"
+async def p8t3_schema_v9(runner: R) -> None:
+    """P8T3: schema v9 — all tables including alerts and recent_events exist (DIRECT, no server)."""
+    name = "P8T3-schema-v9"
     tmp = tempfile.mkdtemp(prefix="evt3_")
     db_path = os.path.join(tmp, "events.db")
     try:
-        # EventStore constructor creates the v7 schema on a fresh DB.
+        # EventStore constructor creates the v9 schema on a fresh DB.
         EventStore(db_path)
         conn = sqlite3.connect(db_path)
         conn.execute("PRAGMA busy_timeout=5000")
-        for tbl in ("source_state", "source_seen_items"):
+        for tbl in ("source_state", "source_seen_items", "alerts", "recent_events"):
             row = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (tbl,)
             ).fetchone()
             runner.assert_true(name + f"-table-{tbl}", row is not None,
                                f"table {tbl} missing")
         ver = conn.execute("PRAGMA user_version").fetchone()[0]
-        runner.assert_eq(name + "-version", ver, 7)
+        runner.assert_eq(name + "-version", ver, 9)
         conn.close()
     except Exception as exc:
         runner.fail(name, str(exc))
@@ -419,7 +419,7 @@ async def main() -> int:
             p7t18_info_fields,
             p8t1_sources_status,
             p8t2_info_features,
-            p8t3_schema_v7,
+            p8t3_schema_v9,
             p8t4_test_source_events,
             p8t5_max_events,
             p8t6_failure_resilience,

@@ -104,15 +104,13 @@ def replay_events(
     limit: int,
     max_replay_limit: int,
     row_to_event,
+    after_sequence: int | None = None,
 ) -> dict[str, Any]:
     """
-    Replay events for a consumer starting from their durable checkpoint.
+    Replay events for a consumer starting from their durable checkpoint,
+    or from an explicit after_sequence if provided.
 
-    Returns events that are:
-    - Relevant to the consumer (via materialized consumer_event_state)
-    - After the consumer's checkpoint
-    - Not yet acknowledged
-    - Ordered by sequence ASC
+    If after_sequence is None, falls back to the consumer's stored checkpoint.
     """
     conn.row_factory = sqlite3.Row
 
@@ -123,12 +121,15 @@ def replay_events(
     if not consumer:
         raise ConsumerNotFoundError(consumer_id)
 
-    # Get checkpoint
-    cp = conn.execute(
-        "SELECT last_sequence FROM consumer_checkpoints WHERE consumer_id = ?",
-        (consumer_id,),
-    ).fetchone()
-    after_seq = cp[0] if cp else 0
+    # Determine starting sequence
+    if after_sequence is not None:
+        after_seq = after_sequence
+    else:
+        cp = conn.execute(
+            "SELECT last_sequence FROM consumer_checkpoints WHERE consumer_id = ?",
+            (consumer_id,),
+        ).fetchone()
+        after_seq = cp[0] if cp else 0
 
     # Fetch relevant unacknowledged events
     effective_limit = min(limit, max_replay_limit)

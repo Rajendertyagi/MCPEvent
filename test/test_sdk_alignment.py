@@ -10,7 +10,7 @@ Covers core SDK contract checks that must hold regardless of feature phase:
   * P7T1      Schema v5 — checkpoints table exists, FK works
   * P7T3      Sync tool works (system_ping)
   * P7T4      Async tools work (event_publish)
-  * P8T8      Extensibility proof — all original 16 tools still present
+  * P8T8      Extensibility proof — all original 16 tools plus 5 alert tools (21 total) still present
 
 Each test is independently runnable and starts/stops its own server instance.
 
@@ -128,7 +128,7 @@ async def test_async_tools_work(runner: R) -> None:
 
 # Legacy ID: P8T8
 async def test_extensibility_proof_original_tools_present(runner: R) -> None:
-    """P8T8: extensibility proof — all original 16 tools still present."""
+    """P8T8: extensibility proof — all original 16 tools still present plus 5 new alert tools (21 total)."""
     name = "P8T8-original-tools"
     tools = await list_tools_names()
     expected_tools = [
@@ -137,6 +137,7 @@ async def test_extensibility_proof_original_tools_present(runner: R) -> None:
         "consumer_event_acknowledge", "consumer_checkpoint_get", "dev_progress_test",
         "dev_long_running_test", "dev_background_publish_test", "dev_task_list",
         "dev_source_start", "dev_source_fail", "dev_source_stop",
+        "alert_create", "alert_list", "alert_get", "alert_enable", "alert_disable",
     ]
     for tool in expected_tools:
         runner.assert_in(name + f"-{tool}", tool, tools)

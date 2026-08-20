@@ -1,6 +1,11 @@
 # MCP Event Server — dependencies
 #
-# The only direct dependency is the official MCP SDK.
-# All other packages (uvicorn, starlette, pydantic, etc.) are
-# pulled in automatically as transitive dependencies.
+# The official MCP SDK is the primary dependency; starlette and uvicorn are
+# declared directly because production code now constructs and runs them
+# explicitly rather than hiding that behind mcp.run().
+# sse-starlette is declared directly because production code uses
+# EventSourceResponse for the generic SSE live event stream.
 mcp>=2.0.0,<3.0.0
+starlette>=0.48.0,<2.0.0
+uvicorn>=0.31.1,<1.0.0
+sse-starlette>=3.0.0,<4.0.0

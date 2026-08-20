@@ -13,7 +13,7 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
 
 
 def get_schema_version(conn: sqlite3.Connection) -> int:
@@ -101,6 +101,39 @@ def create_v7_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX idx_seen_source_seen_at
         ON source_seen_items(source_name, seen_at)
     """)
+    create_alerts_table(conn)
+    create_recent_events_table(conn)
+
+
+def create_alerts_table(conn: sqlite3.Connection) -> None:
+    """Create the generic alert-definition table and its indexes (idempotent)."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS alerts (
+            alert_id          TEXT PRIMARY KEY,
+            consumer_id       TEXT NOT NULL,
+            name              TEXT,
+            source            TEXT NOT NULL,
+            event_type        TEXT,
+            field_path        TEXT NOT NULL,
+            operator          TEXT NOT NULL,
+            value_json        TEXT NOT NULL,
+            enabled           INTEGER NOT NULL DEFAULT 1,
+            one_shot          INTEGER NOT NULL DEFAULT 1,
+            created_at        TEXT NOT NULL,
+            updated_at        TEXT NOT NULL,
+            last_triggered_at TEXT,
+            trigger_count     INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (consumer_id) REFERENCES consumers(consumer_id)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_alerts_consumer_enabled
+        ON alerts(consumer_id, enabled)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_alerts_source_enabled
+        ON alerts(source, enabled)
+    """)
 
 
 def migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
@@ -128,14 +161,14 @@ def migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
                 LEFT JOIN consumer_checkpoints cp ON c.consumer_id = cp.consumer_id
                 WHERE cp.consumer_id IS NULL
             """)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            conn.execute("PRAGMA user_version = 5")
             conn.commit()
             logger.info("migrated v4→v5: added consumer_checkpoints")
         except Exception:
             conn.rollback()
             raise
     else:
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.execute("PRAGMA user_version = 5")
         conn.commit()
         logger.info("event store already at v5 schema")
 
@@ -169,14 +202,14 @@ def migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
                     PRIMARY KEY (source_name, key)
                 )
             """)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            conn.execute("PRAGMA user_version = 6")
             conn.commit()
             logger.info("migrated v5→v6: added source_state")
         except Exception:
             conn.rollback()
             raise
     else:
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.execute("PRAGMA user_version = 6")
         conn.commit()
         logger.info("event store already at v6 schema")
 
@@ -202,16 +235,49 @@ def migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
                 CREATE INDEX idx_seen_source_seen_at
                 ON source_seen_items(source_name, seen_at)
             """)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            conn.execute("PRAGMA user_version = 7")
             conn.commit()
             logger.info("migrated v6→v7: added source_seen_items")
         except Exception:
             conn.rollback()
             raise
     else:
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.execute("PRAGMA user_version = 7")
         conn.commit()
         logger.info("event store already at v7 schema")
+
+
+def migrate_v7_to_v8(conn: sqlite3.Connection) -> None:
+    """Add alerts table for generic alert-definition persistence."""
+    create_alerts_table(conn)
+    conn.execute("PRAGMA user_version = 8")
+    conn.commit()
+    logger.info("migrated v7→v8: added alerts table")
+
+
+def create_recent_events_table(conn: sqlite3.Connection) -> None:
+    """Create the durable recent-event observational journal (idempotent)."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS recent_events (
+            recent_sequence      INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id            TEXT NOT NULL UNIQUE,
+            type                TEXT NOT NULL,
+            source              TEXT NOT NULL,
+            timestamp           TEXT NOT NULL,
+            data_json           TEXT NOT NULL,
+            persistent          INTEGER NOT NULL,
+            persistent_sequence INTEGER,
+            routing_json        TEXT
+        )
+    """)
+
+
+def migrate_v8_to_v9(conn: sqlite3.Connection) -> None:
+    """Add recent_events observational journal table."""
+    create_recent_events_table(conn)
+    conn.execute("PRAGMA user_version = 9")
+    conn.commit()
+    logger.info("migrated v8→v9: added recent_events table")
 
 
 def migrate_v1_to_v3(conn: sqlite3.Connection) -> None:
@@ -266,9 +332,9 @@ def migrate_v1_to_v3(conn: sqlite3.Connection) -> None:
                 FOREIGN KEY (event_id)    REFERENCES persistent_events(id)
             )
         """)
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.execute("PRAGMA user_version = 3")
         conn.commit()
-        logger.info("migrated %d rows v1→v5", old_count)
+        logger.info("migrated %d rows v1→v3", old_count)
     except Exception:
         conn.rollback()
         raise
@@ -306,9 +372,9 @@ def migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
             FOREIGN KEY (event_id)    REFERENCES persistent_events(id)
         )
     """)
-    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    conn.execute("PRAGMA user_version = 3")
     conn.commit()
-    logger.info("migrated v2→v5")
+    logger.info("migrated v2→v3")
 
 
 def migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
@@ -342,16 +408,16 @@ def migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
                     "VALUES (?, ?, ?, ?)",
                     rows,
                 )
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            conn.execute("PRAGMA user_version = 4")
             conn.commit()
-            logger.info("migrated v3→v5: cleaned consumer_event_state (%d rows)", len(rows))
+            logger.info("migrated v3→v4: cleaned consumer_event_state (%d rows)", len(rows))
         except Exception:
             conn.rollback()
             raise
     else:
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.execute("PRAGMA user_version = 4")
         conn.commit()
-        logger.info("event store already at v5 schema (no v3 cleanup needed)")
+        logger.info("event store already at v4 schema (no v3 cleanup needed)")
 
 
 def create_v3_schema_partial(conn: sqlite3.Connection) -> None:

@@ -34,11 +34,15 @@ from store_modules.schema import (
     migrate_v4_to_v5,
     migrate_v5_to_v6,
     migrate_v6_to_v7,
+    migrate_v7_to_v8,
+    migrate_v8_to_v9,
     SCHEMA_VERSION,
 )
+from store_modules import alerts as _alerts
 from store_modules import consumers as _consumers
 from store_modules import delivery as _delivery
 from store_modules import events as _events
+from store_modules import recent_events as _recent_events
 from store_modules import replay as _replay
 from store_modules import source_state as _source_state
 from errors import ConsumerNotFoundError
@@ -79,23 +83,40 @@ class EventStore:
             current_version = get_schema_version(conn)
 
             if current_version == 0:
+                # Fresh database: create the full current schema and set version
                 create_v7_schema(conn)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 conn.commit()
                 logger.info("event store initialized (fresh v%d): %s", SCHEMA_VERSION, self._db_path)
-            elif current_version == 1:
-                migrate_v1_to_v3(conn)
-            elif current_version == 2:
-                migrate_v2_to_v3(conn)
-            elif current_version == 3:
-                migrate_v3_to_v4(conn)
-            elif current_version == 4:
-                migrate_v4_to_v5(conn)
-            elif current_version == 5:
-                migrate_v5_to_v6(conn)
-            elif current_version == 6:
-                migrate_v6_to_v7(conn)
-            else:
+            elif current_version < SCHEMA_VERSION:
+                # Migrate sequentially: one version at a time, re-reading version each step
+                while current_version < SCHEMA_VERSION:
+                    if current_version == 1:
+                        migrate_v1_to_v3(conn)
+                    elif current_version == 2:
+                        migrate_v2_to_v3(conn)
+                    elif current_version == 3:
+                        migrate_v3_to_v4(conn)
+                    elif current_version == 4:
+                        migrate_v4_to_v5(conn)
+                    elif current_version == 5:
+                        migrate_v5_to_v6(conn)
+                    elif current_version == 6:
+                        migrate_v6_to_v7(conn)
+                    elif current_version == 7:
+                        migrate_v7_to_v8(conn)
+                    elif current_version == 8:
+                        migrate_v8_to_v9(conn)
+                    else:
+                        raise RuntimeError(
+                            f"unsupported schema version {current_version}; "
+                            f"expected between 1 and {SCHEMA_VERSION - 1}"
+                        )
+                    # Re-read version after migration (each migration sets its own target)
+                    current_version = get_schema_version(conn)
+                logger.info("event store migrated to v%d: %s", SCHEMA_VERSION, self._db_path)
+            elif current_version == SCHEMA_VERSION:
+                # Already current — ensure indexes exist (defensive idempotency)
                 conn.execute("""
                     CREATE INDEX IF NOT EXISTS idxCES_ack
                     ON consumer_event_state(consumer_id, acknowledged_at)
@@ -106,6 +127,11 @@ class EventStore:
                 """)
                 conn.commit()
                 logger.info("event store ready (v%d): %s", current_version, self._db_path)
+            else:
+                raise RuntimeError(
+                    f"schema version {current_version} exceeds supported max {SCHEMA_VERSION}; "
+                    "upgrade the application first"
+                )
         except Exception:
             conn.rollback()
             raise
@@ -307,13 +333,14 @@ class EventStore:
         self,
         consumer_id: str,
         limit: int = 50,
+        after_sequence: int | None = None,
     ) -> dict[str, Any]:
         """
         Replay events for a consumer starting from their durable checkpoint.
 
         Returns events that are:
         - Relevant to the consumer (via materialized consumer_event_state)
-        - After the consumer's checkpoint
+        - After the consumer's checkpoint (or after_sequence if provided)
         - Not yet acknowledged
         - Ordered by sequence ASC
         """
@@ -321,15 +348,14 @@ class EventStore:
         try:
             result = _replay.replay_events(
                 conn, consumer_id, limit, MAX_REPLAY_LIMIT,
-                _events.row_to_event,
+                _events.row_to_event, after_sequence,
             )
             return result
         except (ValueError, ConsumerNotFoundError):
             raise
-        except Exception as exc:
+        except Exception:
             conn.rollback()
-            logger.error("replay failed for %s: %s", consumer_id, exc)
-            return {"status": "error", "message": str(exc)}
+            raise
         finally:
             conn.close()
 
@@ -347,6 +373,97 @@ class EventStore:
         """
         return _events.is_event_relevant(
             event.get("routing"), consumer_id, consumer_topics)
+
+    # ─── Alert definitions (generic alert engine) ────────────────────────────
+
+    def create_alert(
+        self,
+        alert_id: str,
+        consumer_id: str,
+        name: str | None,
+        source: str,
+        event_type: str | None,
+        field_path: str,
+        operator: str,
+        value: Any,
+        one_shot: bool,
+    ) -> dict[str, Any]:
+        """Persist a new alert definition and return it. Opens/commits its own txn."""
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._open(self._db_path)
+        try:
+            _alerts.insert_alert(
+                conn, alert_id, consumer_id, name, source, event_type,
+                field_path, operator, json.dumps(value, ensure_ascii=False), one_shot, now,
+            )
+            return _alerts.get_alert(conn, consumer_id, alert_id)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def list_alerts(
+        self, consumer_id: str, enabled: bool | None = None
+    ) -> list[dict[str, Any]]:
+        """List alerts owned by a consumer (optional enabled filter)."""
+        conn = self._open(self._db_path)
+        try:
+            return _alerts.list_alerts_by_consumer(conn, consumer_id, enabled)
+        finally:
+            conn.close()
+
+    def list_alerts_by_source_enabled(self, source: str) -> list[dict[str, Any]]:
+        """Evaluation candidate query: enabled alerts for a source."""
+        conn = self._open(self._db_path)
+        try:
+            return _alerts.list_alerts_by_source_enabled(conn, source)
+        finally:
+            conn.close()
+
+    def get_alert(self, consumer_id: str, alert_id: str) -> dict[str, Any] | None:
+        """Return a single alert, ownership-checked. None if not found."""
+        conn = self._open(self._db_path)
+        try:
+            return _alerts.get_alert(conn, consumer_id, alert_id)
+        finally:
+            conn.close()
+
+    def enable_alert(self, consumer_id: str, alert_id: str) -> bool:
+        """Enable an alert. Returns True only if state actually changed."""
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._open(self._db_path)
+        try:
+            return _alerts.update_alert_enabled(conn, consumer_id, alert_id, True, now)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def disable_alert(self, consumer_id: str, alert_id: str) -> bool:
+        """Disable an alert. Returns True only if state actually changed."""
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._open(self._db_path)
+        try:
+            return _alerts.update_alert_enabled(conn, consumer_id, alert_id, False, now)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def record_alert_trigger(self, alert_id: str) -> None:
+        """Atomically record a successful alert trigger (state update)."""
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._open(self._db_path)
+        try:
+            _alerts.record_alert_trigger(conn, alert_id, now)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     # ─── Source state (durable cursors) ──────────────────────────────────────
 
@@ -423,5 +540,75 @@ class EventStore:
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.close()
+
+    # ─── Recent observational history ──────────────────────────────────────────
+
+    def append_recent_event(self, event: dict[str, Any], capacity: int) -> None:
+        """Append a published event to the durable recent journal.
+
+        Capacity is supplied by the caller (events.RECENT_HISTORY_CAPACITY).
+        Failure isolation: the caller is responsible for catching exceptions so
+        an observational-journal failure never fails the authoritative event.
+        """
+        conn = self._open(self._db_path)
+        try:
+            _recent_events.append_recent_event(conn, event, capacity)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_recent_events(
+        self, limit: int, newest_first: bool = False
+    ) -> list[dict[str, Any]]:
+        """Return reconstructed recent events (observational journal)."""
+        conn = self._open(self._db_path)
+        try:
+            return _recent_events.list_recent_events(conn, limit, newest_first)
+        finally:
+            conn.close()
+
+    # ─── System metric aggregates (cheap global queries) ───────────────────────
+
+    def persistent_event_count(self) -> int:
+        """Return COUNT(*) from persistent_events."""
+        conn = self._open(self._db_path)
+        try:
+            return _events.count(conn)
+        finally:
+            conn.close()
+
+    def persistent_high_water(self) -> int:
+        """Return MAX(sequence) from persistent_events, or 0 if empty."""
+        conn = self._open(self._db_path)
+        try:
+            row = conn.execute(
+                "SELECT MAX(sequence) FROM persistent_events"
+            ).fetchone()
+            return row[0] if row and row[0] is not None else 0
+        finally:
+            conn.close()
+
+    def count_consumers(self) -> int:
+        """Return COUNT(*) from consumers table."""
+        conn = self._open(self._db_path)
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM consumers").fetchone()
+            return row[0] if row else 0
+        finally:
+            conn.close()
+
+    def count_unacked_deliveries(self) -> int:
+        """Return COUNT(*) of unacknowledged consumer_event_state rows."""
+        conn = self._open(self._db_path)
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM consumer_event_state "
+                "WHERE acknowledged_at IS NULL"
+            ).fetchone()
+            return row[0] if row else 0
         finally:
             conn.close()

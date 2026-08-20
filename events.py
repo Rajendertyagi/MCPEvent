@@ -22,6 +22,93 @@ logger = logging.getLogger(__name__)
 
 # (RESOURCE_EVENT_LATEST imported from server_modules.contract)
 
+# Bounded in-memory + durable recent-history capacity (single canonical owner).
+RECENT_HISTORY_CAPACITY = 200
+
+# ─── Alert evaluator hook (process-wide, Context-free) ───────────────────────
+# Set once at startup via configure_alert_evaluator(). events.py never imports
+# the alert module directly — this avoids a circular import while still letting
+# the canonical publish path trigger alert evaluation.
+_alert_evaluator = None
+
+
+def configure_alert_evaluator(fn) -> None:
+    """Register the process-wide alert evaluator callable.
+
+    The callable must accept a single event dict and be awaitable (async).
+    It must be Context-free: no MCP Context, ClientSession, or request state.
+    """
+    global _alert_evaluator
+    _alert_evaluator = fn
+
+
+# ─── Metrics collector hook (process-wide, Context-free) ─────────────────────
+# Set once at startup via configure_metrics(). events.py never imports
+# server_modules.metrics — the single canonical RuntimeMetrics instance is
+# injected from server.py, mirroring the alert-evaluator wiring.
+_metrics = None
+
+# ─── SSE broadcast hook (process-wide, Context-free) ────────────────────────
+# Set once at startup via configure_sse_broker(). events.py never imports
+# sse_broker — this avoids a circular import while still letting the
+# canonical publish path fan events out to live SSE subscribers.
+_event_broker = None
+
+
+def configure_sse_broker(broker: Any) -> None:
+    """Register the process-wide SSE broadcast broker."""
+    global _event_broker
+    _event_broker = broker
+
+
+def configure_metrics(metrics) -> None:
+    """Register the process-wide metrics collector.
+
+    The object must expose the RuntimeMetrics recording methods. It must be
+    Context-free and never raise into the publication path (callers guard).
+    """
+    global _metrics
+    _metrics = metrics
+
+
+def _metric(method: str, *args) -> None:
+    """Call a RuntimeMetrics method, never letting a metric fault break the caller."""
+    if _metrics is None:
+        return
+    try:
+        getattr(_metrics, method)(*args)
+    except Exception:
+        logger.debug("metrics.%s raised; ignored", method, exc_info=True)
+
+
+def _record_publication_failure() -> None:
+    """Increment publication_failures_total without ever masking the caller's error."""
+    _metric("record_publication_failure")
+
+
+async def _maybe_evaluate_alerts(event: dict[str, Any]) -> None:
+    """Invoke the alert evaluator after an event is published, if configured.
+
+    Explicit recursion guard: alert.triggered events must never be re-evaluated
+    as alert input. Evaluator failures are logged with a stack trace but do NOT
+    turn the original (already-successful) publication into a failure.
+    """
+    if _alert_evaluator is None:
+        return
+    # Recursion protection — system-generated trigger events are not input.
+    if event.get("type") == "alert.triggered":
+        return
+    try:
+        await _alert_evaluator(event)
+    except Exception:
+        logger.exception(
+            "alert evaluation failed for event id=%s type=%s",
+            event.get("id"),
+            event.get("type"),
+        )
+        _metric("record_alert_failure")
+
+
 # ─── In-memory state ──────────────────────────────────────────────────────────
 
 _latest_event: dict[str, Any] = {
@@ -81,11 +168,13 @@ async def _notify_subscribers_async(
         logger.debug("subscription bus not initialized; notification skipped")
         return
     try:
+        _metric("record_notification_attempted")
         await bus.publish(ResourceUpdated(uri=resource_uri))
     except Exception as exc:
         logger.error(
             "failed to broadcast resource update for %s: %s", resource_uri, exc
         )
+        _metric("record_notification_failed")
 
 
 # ─── Publish ──────────────────────────────────────────────────────────────────
@@ -132,17 +221,21 @@ async def publish_event(
 
     # ── Validation ──────────────────────────────────────────────────────────
     if not event_type or not isinstance(event_type, str):
+        _record_publication_failure()
         raise ValueError("event_type must be a non-empty string")
     if not source or not isinstance(source, str):
+        _record_publication_failure()
         raise ValueError("source must be a non-empty string")
     if data is None:
         data = {}
     elif not isinstance(data, dict):
+        _record_publication_failure()
         raise ValueError("data must be a JSON-compatible object (dict)")
 
     # ── Validate routing if provided ────────────────────────────────────────
     if routing is not None:
         if not isinstance(routing, dict):
+            _record_publication_failure()
             raise ValueError("routing must be a dict or None")
         targets = routing.get("targets")
         if targets is not None:
@@ -192,6 +285,7 @@ async def publish_event(
             )
         except Exception as exc:
             logger.error("failed to persist event %s: %s", event_id, exc)
+            _record_publication_failure()
             raise RuntimeError(
                 f"persistent event publication failed: {exc}"
             ) from exc
@@ -203,8 +297,13 @@ async def publish_event(
 
     with _history_lock:
         _event_history.append(event)
-        while len(_event_history) > 200:
+        while len(_event_history) > RECENT_HISTORY_CAPACITY:
             _event_history.pop(0)
+
+    # ── Metrics: successful authoritative acceptance ─────────────────────────
+    _metric("record_event_published", persistent)
+    if event["type"] == "alert.triggered":
+        _metric("record_alert_triggered")
 
     logger.info(
         "event  id=%s  type=%s  source=%s  persistent=%s  seq=%s",
@@ -215,7 +314,54 @@ async def publish_event(
         sequence,
     )
 
+    # ── Durable recent observational journal (failure-isolated) ──────────────
+    try:
+        if store is not None:
+            await asyncio.to_thread(
+                store.append_recent_event,
+                event,
+                capacity=RECENT_HISTORY_CAPACITY,
+            )
+    except Exception:
+        logger.exception(
+            "recent-history journal append failed for event id=%s type=%s",
+            event.get("id"),
+            event.get("type"),
+        )
+        _metric("record_recent_history_failure")
+        # Observational failure must NOT fail the authoritative publication.
+
     # ── Live notification ───────────────────────────────────────────────────
     await _notify_subscribers_async(RESOURCE_EVENT_LATEST, bus)
 
+    # ── SSE fan-out (fire-and-forget, failure-isolated) ─────────────────────
+    if _event_broker is not None:
+        try:
+            _event_broker.broadcast(json.dumps(event, ensure_ascii=False))
+        except Exception:
+            logger.debug(
+                "SSE broadcast failed for event id=%s type=%s",
+                event.get("id"),
+                event.get("type"),
+                exc_info=True,
+            )
+
+    # ── Alert evaluation (post-publish hook, Context-free) ───────────────────
+    await _maybe_evaluate_alerts(event)
+
     return event
+
+
+def restore_recent_history(events_list: list[dict[str, Any]]) -> None:
+    """Hydrate in-memory latest/history from the durable recent journal.
+
+    HYDRATION ONLY: does not publish, notify, materialize routing, evaluate
+    alerts, or increment publication counters. Restart must not replay history
+    as new activity.
+    """
+    global _latest_event, _event_history
+    if not events_list:
+        return
+    with _history_lock:
+        _event_history = list(events_list)  # oldest -> newest
+        _latest_event = events_list[-1]

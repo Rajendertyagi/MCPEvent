@@ -5,9 +5,10 @@ Consumer tools: consumer_register, consumer_topic_add, consumer_event_list.
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Annotated, Any
 
 from errors import ValidationError, StorageError, ConsumerNotFoundError
+from pydantic import Field, StrictInt
 from server_modules.contract import (
     TOOL_CONSUMER_REGISTER,
     TOOL_CONSUMER_TOPIC_ADD,
@@ -50,7 +51,7 @@ def register_consumer_tools(mcp, services, **kwargs) -> None:
     @mcp.tool(name=TOOL_CONSUMER_EVENT_LIST)
     async def list_relevant_events(
         consumer_id: str,
-        after_sequence: int | None = None,
+        after_sequence: Annotated[StrictInt, Field(ge=0)] | None = None,
         limit: int = 50,
     ) -> dict[str, Any]:
         """
@@ -62,6 +63,14 @@ def register_consumer_tools(mcp, services, **kwargs) -> None:
         consumer_id = consumer_id.strip()
         if not consumer_id:
             raise ValidationError("consumer_id must not be empty after trimming")
+
+        # Validate after_sequence: None or non-negative integer (reject bool, float, string, negative).
+        # The StrictInt annotation already enforces this at the SDK/Pydantic layer; this is defense-in-depth.
+        if after_sequence is not None:
+            if isinstance(after_sequence, bool) or not isinstance(after_sequence, int):
+                raise ValidationError("after_sequence must be a non-negative integer or null")
+            if after_sequence < 0:
+                raise ValidationError("after_sequence must be a non-negative integer or null")
 
         effective_limit = min(limit, services.replay_cfg["max_limit"])
         event_list = await asyncio.to_thread(

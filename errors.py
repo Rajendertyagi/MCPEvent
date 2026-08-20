@@ -33,6 +33,14 @@ class EventNotFoundError(ValidationError):
         super().__init__(f"event not found: {event_id}")
 
 
+class AlertNotFoundError(ValidationError):
+    """The referenced alert definition does not exist or is not owned by the consumer."""
+
+    def __init__(self, alert_id: str) -> None:
+        self.alert_id = alert_id
+        super().__init__(f"alert not found: {alert_id}")
+
+
 class EventNotRelevantError(MCPEventServerError):
     """The event exists but is not relevant to the consumer."""
 

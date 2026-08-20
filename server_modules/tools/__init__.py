@@ -9,6 +9,7 @@ from server_modules.tools.replay import register_replay_tools
 from server_modules.tools.sources import register_source_tools
 from server_modules.tools.background import register_background_tools
 from server_modules.tools.dev import register_dev_tools
+from server_modules.tools.alerts import register_alert_tools
 
 __all__ = [
     "register_system_tools",
@@ -18,4 +19,5 @@ __all__ = [
     "register_source_tools",
     "register_background_tools",
     "register_dev_tools",
+    "register_alert_tools",
 ]

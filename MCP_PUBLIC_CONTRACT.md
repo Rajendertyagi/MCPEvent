@@ -1,8 +1,8 @@
 # MCP Event Server — Public Contract
 
-**Version:** 1.0.0
+**Version:** 1.0.0 (FROZEN) · 1.1.0-candidate (alert engine) · 1.2.0-candidate (metrics + recent + pagination, NOT FROZEN)
 **MCP Spec:** 2026-07-28
-**Status:** FROZEN
+**Status:** FROZEN (v1.0.0); v1.1.0-candidate additive — pending independent verification
 **Last reviewed:** 2026-08-18
 **Frozen:** 2026-08-18 — frozen only after independent naming-migration verification (verdict: PUBLIC MCP NAMING MIGRATION v1 VERIFIED — READY TO FREEZE)
 
@@ -19,13 +19,15 @@
 | `stateless_http` | `True` | **FREEZE** |
 | `json_response` | `True` | **FREEZE** |
 | `max_request_body_size` | From config (`max_request_body_size_mb * 1024 * 1024`) | Runtime config |
-| `transport_security` | `None` | Runtime config |
+| `transport_security` | Explicit `TransportSecuritySettings` (DNS rebinding protection enabled; localhost-only allowed hosts/origins) | Runtime config — constructed from `config.json` keys `enable_dns_rebinding_protection`, `allowed_hosts`, `allowed_origins` |
 
 **Client connection:** Connect to `http://{host}:{port}/mcp`. Use the MCP Python SDK `streamable_http_client` with `ClientSession`.
 
+**HTTP liveness endpoint (not MCP):** `GET /health` → `200 {"status": "ok"}`. Unauthenticated. Does not require MCP initialization. Intended for local watchdog / process supervisor.
+
 ---
 
-## 2. Production Tools (9)
+## 2. Production Tools (14)
 
 These are the tools the broker project should depend on.
 
@@ -37,9 +39,14 @@ These are the tools the broker project should depend on.
 | `consumer_register` | `consumer_id` (str) | Register a durable consumer identity. Idempotent. Also creates checkpoint at 0. | **FREEZE** |
 | `consumer_topic_add` | `consumer_id` (str), `topic` (str) | Assign a topic to a consumer for topic-based routing. | **FREEZE** |
 | `consumer_event_list` | `consumer_id` (str), `after_sequence` (int, optional), `limit` (int, default 50) | List persistent events relevant to a consumer, ordered by sequence ASC. Marks delivery. | **FREEZE** |
-| `consumer_event_pending_list` | `consumer_id` (str), `limit` (int, default 50) | Replay unacknowledged persistent events from consumer's checkpoint. Primary reconnect tool. | **FREEZE** |
+| `consumer_event_pending_list` | `consumer_id` (str), `limit` (int, default 50), `after_sequence` (int|null, optional) | Replay unacknowledged persistent events from consumer's checkpoint (or from explicit `after_sequence` for pagination). Primary reconnect tool. Returns `next_after_sequence` for paging. | **FREEZE** + **v1.2.0-candidate** |
 | `consumer_event_acknowledge` | `consumer_id` (str), `event_id` (str) | ACK an event for a consumer. Idempotent. Advances checkpoint. | **FREEZE** |
 | `consumer_checkpoint_get` | `consumer_id` (str) | Get the consumer's current durable checkpoint sequence. | **FREEZE** |
+| `alert_create` | `consumer_id` (str), `source` (str), `field_path` (str), `operator` (str), `value` (JSON scalar), `name` (str, optional), `event_type` (str, optional), `one_shot` (bool, default True) | Create a generic alert definition. Fires when a `source` event satisfies `field_path <operator> value`. | **v1.1.0-candidate** |
+| `alert_list` | `consumer_id` (str), `enabled` (bool, optional) | List alert definitions owned by a consumer. | **v1.1.0-candidate** |
+| `alert_get` | `consumer_id` (str), `alert_id` (str) | Get a single alert definition (ownership-checked). Raises `AlertNotFoundError` if missing. | **v1.1.0-candidate** |
+| `alert_enable` | `consumer_id` (str), `alert_id` (str) | Enable a disabled alert. Returns `changed=true` only if it was disabled. | **v1.1.0-candidate** |
+| `alert_disable` | `consumer_id` (str), `alert_id` (str) | Disable an alert (stops evaluation, no deletion). Returns `changed=true` only if it was enabled. | **v1.1.0-candidate** |
 
 ---
 
@@ -59,13 +66,15 @@ These are available but intended for development and testing. The broker project
 
 ---
 
-## 4. Resources (4)
+## 4. Resources (6)
 
 | Resource URI | Data Shape | Description | Status |
 |-------------|-----------|-------------|--------|
 | `mcp-event://events/latest` | Event dict (see §5) | The most recently published event. Updated via `ResourceUpdated` notification. | **FREEZE** |
 | `mcp-event://events/pending` | Array of event dicts (newest first, max 100) | All persistent events, newest first. | **FREEZE** |
+| `mcp-event://events/recent` | Array of event dicts (newest first, max 200) | Bounded durable observational journal. Includes both persistent and nonpersistent events. **NOT pending delivery, NOT replay API, NOT ACKable, NOT checkpoint input.** Restart-safe. | **v1.2.0-candidate** |
 | `mcp-event://system/info` | Dict with server metadata | Server name, version, features, limits, endpoint, uptime, counts. See §17 for field classification. | **FREEZE** |
+| `mcp-event://system/metrics` | Dict with operational metrics | Process-wide counters: events, alerts, notifications, sources, recent history, system aggregates. No secrets or payloads. | **v1.2.0-candidate** |
 | `mcp-event://sources/status` | Dict of source status objects | Status of each registered source connector. Includes name, type, state, error, cursor, dedup stats. Secrets are sanitized. | **FREEZE** |
 
 ---
@@ -255,17 +264,32 @@ Routing metadata is **frozen at publication time**. It is never recomputed from 
 
 ---
 
-## 16. Future Alert Engine Preparation
+## 16. Generic Alert Engine (v1.1.0-candidate — NOT FROZEN)
 
-The following concepts are reserved for future alert engine implementation. Current naming should not conflict:
+Implemented in v1.1.0-candidate (additive on frozen v1.0.0). The engine is generic: it
+matches a published event against persisted alert definitions and, on a match, publishes a
+canonical `alert.triggered` event via the same `publish_event()` path used by all sources.
+No broker-specific logic is present.
 
-| Future concept | Reserved field/name pattern |
-|---------------|---------------------------|
-| Alert definition | `alert_id`, `consumer_id`, `field`, `operator`, `value`, `enabled`, `created_at` |
-| Alert trigger | Event type `alert.triggered` |
-| Alert storage | New table `alert_definitions` + `alert_triggers` (separate from `persistent_events`) |
+| Concept | Implemented name / pattern |
+|---------|---------------------------|
+| Alert definition | Table `alerts` (single table; supersedes the reserved `alert_definitions` + `alert_triggers` split from the pre-freeze plan) |
+| Alert identity | `alert_id` (UUID v4 hex), `consumer_id` (owner) |
+| Condition | `field_path` (dotted, e.g. `data.price`), `operator` (`eq`, `ne`, `gt`, `gte`, `lt`, `lte`), `value` (JSON scalar) |
+| Optional scoping | `event_type` (null = any type from `source`), `source` (required) |
+| Lifecycle | `enabled` (bool), `one_shot` (bool, default True → auto-disables after one trigger) |
+| Trigger event | `type="alert.triggered"`, `source="alert_engine"`, `persistent=True`, `routing.targets=[consumer_id]` |
+| Trigger payload | `alert_id`, `consumer_id`, `matched_event_id`, `matched_event_type`, `matched_source`, `field_path`, `operator`, `expected_value`, `observed_value`, `one_shot` (+ `name` when set) |
 
-**No naming conflicts detected** with current event schema or tool names. The `alerts://pending` URI was renamed to `mcp-event://events/pending` before freeze (see §15).
+**Semantics (v1.1.0-candidate):**
+- Field absence (`field_path` not present in `data`) → condition does NOT match. JSON `null` is a legitimate value that participates in `eq`/`ne`.
+- `eq`/`ne`: scalar equality (type-aware; bool distinct from numeric). `gt`/`gte`/`lt`/`lte`: numeric only (bool is NOT numeric); non-numeric observed/expected → no match (not an error). No string→number coercion.
+- `alert_enable` / `alert_disable` return `changed=true` only when the state actually flips; idempotent calls return `changed=false`. `AlertNotFoundError` is raised for unknown/non-owned alerts; `ConsumerNotFoundError` for unknown consumers.
+- Recursion guard: `alert.triggered` events are never re-evaluated as alert input.
+- Per-alert concurrency lock prevents double-trigger within a process; `one_shot` alerts disable atomically after the trigger event is published.
+
+**No naming conflicts** with the frozen v1.0.0 event schema or tool names. The `alerts://pending`
+URI was renamed to `mcp-event://events/pending` before freeze (see §15).
 
 ---
 
@@ -367,6 +391,99 @@ Engineering principle: ONE STABLE CONCEPT → ONE CANONICAL OWNER → IMPORT/REU
 
 ---
 
+## 19b. mcp-event://system/metrics Resource (v1.2.0-candidate)
+
+**Status:** CANDIDATE · NOT FROZEN
+
+Returns a JSON object with process-wide operational counters. No secrets, payloads, tokens, or filesystem paths are exposed. All counters are process-lifetime; they reset on restart.
+
+```json
+{
+  "started_at": "ISO8601",
+  "uptime_seconds": 123.4,
+  "events": {
+    "published_total": 0,
+    "persistent_total": 0,
+    "nonpersistent_total": 0,
+    "publication_failures_total": 0,
+    "alert_triggered_total": 0
+  },
+  "alerts": {
+    "evaluations_total": 0,
+    "matches_total": 0,
+    "failures_total": 0
+  },
+  "notifications": {
+    "attempted_total": 0,
+    "failed_total": 0
+  },
+  "sources": {
+    "published_total": 0,
+    "failures_total": 0
+  },
+  "recent_history": {
+    "failures_total": 0,
+    "count": 0,
+    "capacity": 200
+  },
+  "system": {
+    "persistent_event_count": 0,
+    "persistent_high_water": 0,
+    "consumer_count": 0,
+    "pending_deliveries": 0
+  }
+}
+```
+
+**Counter semantics:**
+- `events.publication_failures_total` counts `publish_event` attempts that fail **before** successful acceptance (validation failures + persistent-save failures). It does NOT count recent-journal, notification, or alert-evaluation failures (those have their own counters).
+- `alerts.evaluations_total` increments once per event handed to the evaluator (not once per candidate).
+- `alerts.matches_total` increments per matching alert definition.
+- `alerts.failures_total` counts unexpected evaluator exceptions.
+- `sources.published_total` is a distinct dimension from `events.published_total`; a source event increments both (source-originated subset).
+- `system.persistent_event_count = COUNT(*)`; `system.persistent_high_water = MAX(sequence)`.
+
+---
+
+## 19c. mcp-event://events/recent Resource (v1.2.0-candidate)
+
+**Status:** CANDIDATE · NOT FROZEN
+
+Returns the bounded durable observational event journal (max 200 events, newest-first).
+
+**Semantics:**
+- **Observational only** — not pending delivery, not replay API, not ACKable, not checkpoint input.
+- Includes both `persistent=True` and `persistent=False` events.
+- Survives restart (hydrated from SQLite on startup).
+- A nonpersistent event in this journal does NOT enter `consumer_event_state`, pending, ACK, or checkpoint.
+
+**Response shape:** Array of event dicts (same schema as §5), newest first.
+
+---
+
+## 19d. consumer_event_pending_list Pagination (v1.2.0-candidate)
+
+**Status:** CANDIDATE · NOT FROZEN
+
+The tool now accepts an optional `after_sequence` parameter for pagination:
+
+```
+consumer_event_pending_list(
+    consumer_id: str,
+    limit: int = 50,
+    after_sequence: int | None = None
+)
+```
+
+- `after_sequence = None` → existing checkpoint-based behavior (unchanged).
+- `after_sequence = N` → returns relevant pending events with `sequence > N`.
+- Returns `next_after_sequence` which is valid input for the next page.
+- No OFFSET; ascending sequence; max limit 500.
+- ACK and checkpoint semantics unchanged.
+- Validation rejects `bool`, float, negative, or string values.
+
+---
+
 ## 20. Open Issues (Tracked Separately — Non-Blocking for Frozen Contract)
 
 | # | Issue | Severity | Status |
@@ -385,9 +502,9 @@ Engineering principle: ONE STABLE CONCEPT → ONE CANONICAL OWNER → IMPORT/REU
 | Section | Status |
 |---------|--------|
 | Endpoint & Transport | ✅ FROZEN |
-| Production Tools (9) | ✅ FROZEN |
+| Production Tools (14) | ✅ FROZEN (9) + **v1.1.0-candidate** (5 alert) |
 | Dev/Test Tools (7) | ✅ IDENTIFIED — not for broker dependency |
-| Resources (4) | ✅ FROZEN |
+| Resources (4 + 2 candidate) | ⚠️ 4 FROZEN + 2 CANDIDATE |
 | Event Schema | ✅ FROZEN |
 | Routing | ✅ FROZEN |
 | Consumer Identity | ✅ FROZEN |
@@ -399,6 +516,10 @@ Engineering principle: ONE STABLE CONCEPT → ONE CANONICAL OWNER → IMPORT/REU
 | Error Contract | ✅ FROZEN |
 | Source Contract | ✅ FROZEN |
 | Versioning Policy | ✅ FROZEN |
+| Generic Alert Engine (5 tools) | ⚠️ v1.1.0-candidate — NOT FROZEN |
+| Observability / Metrics (1 resource) | ⚠️ v1.2.0-candidate — NOT FROZEN |
+| Durable Recent History (1 resource) | ⚠️ v1.2.0-candidate — NOT FROZEN |
+| Replay Pagination (`after_sequence`) | ⚠️ v1.2.0-candidate — NOT FROZEN |
 
 ---
 
@@ -421,4 +542,9 @@ PUBLIC MCP CONTRACT v1.0.0 — FROZEN
 
 **Compatibility policy (post-freeze):** Renaming/removing tools or resources, changing required parameters, event-field semantics, routing semantics, consumer identity, ACK/checkpoint/replay semantics requires an explicit breaking/versioned contract decision. Additive tools, resources, and optional event fields remain backward-compatible where appropriate.
 
-**CONTRACT_VERSION remains `1.0.0` — not bumped.**
+**CONTRACT_VERSION is `1.2.0-candidate` — not frozen.**
+
+Historical frozen baseline is `1.0.0`. The v1.1.0-candidate alert engine and v1.2.0-candidate
+observability features (metrics, recent-events journal, replay pagination) are additive and
+not yet frozen. The production tool surface is 14 tools (9 original frozen + 5 alert candidate)
+plus 6 resources (4 frozen + 2 candidate).

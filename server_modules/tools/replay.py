@@ -5,9 +5,10 @@ Replay tools: consumer_event_pending_list, consumer_event_acknowledge, consumer_
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Annotated, Any
 
 from errors import ValidationError
+from pydantic import Field, StrictInt
 from server_modules.contract import (
     TOOL_CONSUMER_EVENT_PENDING_LIST,
     TOOL_CONSUMER_EVENT_ACKNOWLEDGE,
@@ -23,20 +24,32 @@ def register_replay_tools(mcp, services, **kwargs) -> None:
     async def get_pending_events(
         consumer_id: str,
         limit: int = 50,
+        after_sequence: Annotated[StrictInt, Field(ge=0)] | None = None,
     ) -> dict[str, Any]:
         """
         Get pending (unacknowledged) persistent events for a consumer,
-        starting from the consumer's durable checkpoint.
-
-        This is the primary replay/reconnect tool.
+        starting from the consumer's durable checkpoint or an explicit
+        after_sequence for pagination.
         """
         consumer_id = consumer_id.strip()
         if not consumer_id:
             raise ValidationError("consumer_id must not be empty after trimming")
 
+        # Validate after_sequence: None or non-negative integer (reject bool, float, string, negative)
+        if after_sequence is not None:
+            if isinstance(after_sequence, bool) or not isinstance(after_sequence, int):
+                raise ValidationError("after_sequence must be a non-negative integer or null")
+            if after_sequence < 0:
+                raise ValidationError("after_sequence must be a non-negative integer or null")
+
         effective_limit = min(limit, services.replay_cfg["max_limit"])
         return await run_with_timeout(
-            asyncio.to_thread(services.store.replay_events, consumer_id=consumer_id, limit=effective_limit),
+            asyncio.to_thread(
+                services.store.replay_events,
+                consumer_id=consumer_id,
+                limit=effective_limit,
+                after_sequence=after_sequence,
+            ),
             operation=f"get_pending_events({consumer_id})",
             timeout_seconds=services.timeouts["database_seconds"],
         )

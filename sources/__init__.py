@@ -48,9 +48,10 @@ class Publisher:
     SQLite directly.
     """
 
-    def __init__(self, store: Any, bus: Any) -> None:
+    def __init__(self, store: Any, bus: Any, metrics: Any = None) -> None:
         self._store = store
         self._bus = bus
+        self._metrics = metrics
 
     async def __call__(
         self,
@@ -62,7 +63,7 @@ class Publisher:
     ) -> dict[str, Any]:
         import events  # deferred to avoid circular import at module load
         try:
-            return await events.publish_event(
+            result = await events.publish_event(
                 event_type=event_type,
                 source=source,
                 data=data,
@@ -71,7 +72,20 @@ class Publisher:
                 store=self._store,
                 bus=self._bus,
             )
+            # Count source-originated success separately (distinct dimension from
+            # events.published_total — not double-counting the same metric).
+            if self._metrics is not None:
+                try:
+                    self._metrics.record_source_published()
+                except Exception:
+                    pass
+            return result
         except Exception as exc:
+            if self._metrics is not None:
+                try:
+                    self._metrics.record_source_failure()
+                except Exception:
+                    pass
             raise PublishError(
                 f"publish_event failed for source={source!r} type={event_type!r}: {exc}"
             ) from exc
@@ -124,9 +138,9 @@ class Publisher:
         )
 
 
-def create_publisher(store: Any, bus: Any) -> Publisher:
+def create_publisher(store: Any, bus: Any, metrics: Any = None) -> Publisher:
     """Build a Publisher for the given store/bus."""
-    return Publisher(store, bus)
+    return Publisher(store, bus, metrics)
 
 
 # ---------------------------------------------------------------------------
@@ -184,12 +198,13 @@ class SourceManager:
         bg_manager: Any,
         store: Any,
         bus: Any,
+        metrics: Any = None,
     ) -> None:
         """Set references.  Must be called before start_all()."""
         self._bg_manager = bg_manager
         self._store = store
         self._bus = bus
-        self._publisher = create_publisher(store, bus)
+        self._publisher = create_publisher(store, bus, metrics)
 
     def register(self, source: Any) -> None:
         """Register a source instance.  Must be called before start_all()."""

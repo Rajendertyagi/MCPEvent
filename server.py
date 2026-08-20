@@ -7,11 +7,20 @@ publish_event() directly; do NOT duplicate notification logic elsewhere.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import sys
+from contextlib import asynccontextmanager
 from typing import Any
+
+import uvicorn
+from sse_starlette import EventSourceResponse, ServerSentEvent
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route
 
 # Ensure the script's directory is on sys.path so relative imports work
 # regardless of how the script is invoked.
@@ -21,6 +30,7 @@ if _SCRIPT_DIR not in sys.path:
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.subscriptions import InMemorySubscriptionBus
+from mcp.server.transport_security import TransportSecuritySettings
 
 import events
 import runtime
@@ -34,6 +44,7 @@ from errors import (
     ValidationError,
 )
 from sources import SourceManager, build_source_manager, SourceConfigError
+from sse_broker import EventBroker
 
 # ---------------------------------------------------------------------------
 # SDK responsibility vs. application responsibility
@@ -63,11 +74,16 @@ from server_modules.contract import (
     RESOURCE_EVENTS_PENDING,
     RESOURCE_SYSTEM_INFO,
     RESOURCE_SOURCES_STATUS,
+    RESOURCE_SYSTEM_METRICS,
+    RESOURCE_EVENTS_RECENT,
 )
+from server_modules.metrics import RuntimeMetrics
+from server_modules.alerts import AlertEvaluator
 from server_modules.lifecycle import print_banner, print_shutdown, run_with_timeout
 from server_modules.resources import register_resources
 from server_modules.services import Services
 from server_modules.tools import (
+    register_alert_tools,
     register_background_tools,
     register_consumer_tools,
     register_dev_tools,
@@ -128,6 +144,16 @@ TIMEOUTS = _config["timeouts"]
 REPLAY_CFG = _config["replay"]
 SOURCES_CFG = _config.get("sources", {})
 
+# ── Transport security (DNS-rebinding protection) ────────────────────────────
+# Explicit construction removes ambiguity vs. SDK auto-detection.
+# Defaults match what the SDK applies when host is localhost and no settings
+# are provided — but making them explicit means config.json can override them.
+_transport_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=_config.get("enable_dns_rebinding_protection", True),
+    allowed_hosts=_config.get("allowed_hosts", ["127.0.0.1:*", "localhost:*", "[::1]:*"]),
+    allowed_origins=_config.get("allowed_origins", ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]),
+)
+
 # Resource URIs — canonical definitions are in server_modules.contract
 EVENT_RESOURCE_URI = RESOURCE_EVENT_LATEST
 EVENTS_PENDING_URI = RESOURCE_EVENTS_PENDING
@@ -142,9 +168,20 @@ _db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), DATA_DIR, "e
 _store = runtime.event_store_module.EventStore(_db_path)
 _app_logger.info("event store: %s", _store.db_path)
 
+# ── Startup: restore durable recent history ──────────────────────────────────
+import events as _events_mod
+_recent = _store.get_recent_events(
+    limit=_events_mod.RECENT_HISTORY_CAPACITY,
+    newest_first=False,
+)
+_events_mod.restore_recent_history(_recent)
+_app_logger.info("recent-history restored: %d event(s)", len(_recent))
+
 # ============================================================
 # INFRASTRUCTURE (must precede MCPServer construction)
 # ============================================================
+
+_metrics = RuntimeMetrics()
 
 _subscription_bus = InMemorySubscriptionBus()
 _bg_task_manager = runtime.BackgroundTaskManager()
@@ -164,6 +201,7 @@ _lifespan = runtime.make_lifespan(
     source_manager=_source_manager,
     bus=_subscription_bus,
     source_configs=SOURCES_CFG,
+    metrics=_metrics,
 )
 
 # ============================================================
@@ -190,7 +228,22 @@ _services = Services(
     source_manager=_source_manager,
     timeouts=TIMEOUTS,
     replay_cfg=REPLAY_CFG,
+    metrics=_metrics,
 )
+
+# ── Alert engine (generic, Context-free) ──────────────────────────────────────
+# Single-process MVP: the evaluator is wired to the canonical publish path via
+# events.configure_alert_evaluator(). It depends only on the store and the
+# subscription bus — no MCP Context, ClientSession, or request state.
+_alert_evaluator = AlertEvaluator(store=_store, subscription_bus=_subscription_bus, metrics=_metrics)
+events.configure_alert_evaluator(_alert_evaluator.evaluate)
+events.configure_metrics(_metrics)
+
+# ── SSE broadcast broker ──────────────────────────────────────────────────────
+# Wired to the canonical publish path so every published event fans out to
+# connected GET /events/stream subscribers automatically.
+_event_broker = EventBroker()
+events.configure_sse_broker(_event_broker)
 
 # ============================================================
 # REGISTER RESOURCES
@@ -205,6 +258,8 @@ _constants = {
     "EVENTS_PENDING_URI": EVENTS_PENDING_URI,
     "INFO_RESOURCE_URI": INFO_RESOURCE_URI,
     "SOURCES_RESOURCE_URI": SOURCES_RESOURCE_URI,
+    "METRICS_RESOURCE_URI": RESOURCE_SYSTEM_METRICS,
+    "RECENT_RESOURCE_URI": RESOURCE_EVENTS_RECENT,
     "LISTEN_HOST": LISTEN_HOST,
     "LISTEN_PORT": LISTEN_PORT,
 }
@@ -222,6 +277,79 @@ register_replay_tools(mcp, _services)
 register_source_tools(mcp, _services)
 register_background_tools(mcp, _services)
 register_dev_tools(mcp, _services)
+register_alert_tools(mcp, _services)
+
+# ============================================================
+# ASGI APPLICATION (top-level Starlette + Uvicorn)
+# ============================================================
+
+# Build the MCP Streamable HTTP ASGI app.  This creates the internal
+# StreamableHTTPSessionManager, registers the /mcp route, and includes any
+# custom routes added via @mcp.custom_route.  The SDK nests the application
+# lifespan inside the session-manager lifespan automatically.
+mcp_asgi_app = mcp.streamable_http_app(
+    streamable_http_path="/mcp",
+    stateless_http=True,
+    json_response=True,
+    max_request_body_size=MAX_REQUEST_BODY_SIZE,
+    transport_security=_transport_security,
+)
+
+
+async def _health_check(request: Request) -> JSONResponse:  # noqa: ARG001
+    """Minimal liveness probe — returns 200 without requiring MCP init."""
+    return JSONResponse({"status": "ok"})
+
+
+async def _event_stream(request: Request) -> Response:
+    """
+    Generic SSE live event stream at GET /events/stream.
+
+    Each connected client receives every canonical event published through
+    publish_event() as an SSE ``event: event`` message carrying the full
+    event JSON as its ``data:`` field.  Slow subscribers are dropped
+    silently so the publish path is never blocked.
+
+    The stream is independent of MCP transport security — it is a plain
+    HTTP endpoint served by the top-level Starlette app.
+    """
+    async def _generate() -> Any:
+        async with _event_broker.subscribe() as events_async_iter:
+            async for line in events_async_iter:
+                yield line
+                yield "\r\n"  # terminate the SSE message
+
+    return EventSourceResponse(
+        _generate(),
+        media_type="text/event-stream",
+        ping=15,  # keepalive interval in seconds
+    )
+
+
+@asynccontextmanager
+async def _lifespan(app: Starlette) -> None:  # noqa: ARG001
+    """
+    Top-level lifespan owner.
+
+    Delegates to the MCP SDK session manager via the SDK-supported pattern
+    (async with session_manager.run(): yield).  The SDK, in turn, calls the
+    application lifespan (_lifespan passed to MCPServer) so source managers
+    and background tasks start/stop correctly.
+    """
+    async with mcp_asgi_app.router.lifespan_context(app):
+        yield
+
+
+# One top-level Starlette app: MCP protocol routes + /health + /events/stream.
+app = Starlette(
+    routes=list(mcp_asgi_app.routes)
+    + [
+        Route("/health", endpoint=_health_check, methods=["GET"]),
+        Route("/events/stream", endpoint=_event_stream, methods=["GET"]),
+    ],
+    middleware=list(mcp_asgi_app.user_middleware),
+    lifespan=_lifespan,
+)
 
 # ============================================================
 # RUN SERVER
@@ -241,17 +369,16 @@ if __name__ == "__main__":
         timeouts=TIMEOUTS,
     )
 
+    config = uvicorn.Config(
+        app,
+        host=LISTEN_HOST,
+        port=LISTEN_PORT,
+        log_level=LOG_LEVEL.lower(),
+    )
+    server = uvicorn.Server(config)
+
     try:
-        mcp.run(
-            transport="streamable-http",
-            host=LISTEN_HOST,
-            port=LISTEN_PORT,
-            streamable_http_path="/mcp",
-            stateless_http=True,
-            json_response=True,
-            max_request_body_size=MAX_REQUEST_BODY_SIZE,
-            transport_security=None,
-        )
+        asyncio.run(server.serve())
     except KeyboardInterrupt:
         print_shutdown()
         sys.exit(0)
